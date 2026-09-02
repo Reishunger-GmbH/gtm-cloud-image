@@ -9,7 +9,7 @@
 ARG UPSTREAM_TAG=stable
 FROM gcr.io/cloud-tagging-10302018/gtm-cloud-image:${UPSTREAM_TAG} AS upstream
 
-FROM node:24 AS build-env
+FROM node:26 AS build-env
 COPY --from=upstream /app/package.json /app/package-lock.json /app/
 COPY --from=upstream /app/server_bin.js /app/health_checker_bin.js /app/
 COPY --from=upstream /app/public_suffix_list.json /app/LICENSE /app/
