@@ -1,0 +1,6 @@
+services:
+  gtm:
+    build: .
+    image: gtm-cloud-image:local
+    # Distroless entrypoint is node; args are passed to CMD
+    command: ["server_bin.js", "--help"]

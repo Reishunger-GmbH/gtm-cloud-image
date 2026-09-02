@@ -1,0 +1,216 @@
+name: Sync upstream GTM image
+
+on:
+  schedule:
+    # Daily 01:21 UTC — poll only; rebuild runs only when digest changed
+    - cron: "21 1 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Force rebuild even if upstream digests are unchanged
+        type: boolean
+        default: false
+  push:
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_IMAGE: gcr.io/cloud-tagging-10302018/gtm-cloud-image
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check:
+    name: Detect upstream change
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.upstream.outputs.should_build }}
+      targets: ${{ steps.upstream.outputs.targets }}
+      build_matrix: ${{ steps.upstream.outputs.build_matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read published stable digest label
+        id: published_stable
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: >
+          python3 scripts/read-published-digest.py
+          --image "${IMAGE}"
+          --tag stable
+          --output-key published_stable
+          --github-output
+
+      - name: Read published latest digest label
+        id: published_latest
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: >
+          python3 scripts/read-published-digest.py
+          --image "${IMAGE}"
+          --tag latest
+          --output-key published_latest
+          --github-output
+
+      - name: Resolve watch tags and rebuild targets
+        id: upstream
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_FORCE: ${{ inputs.force || false }}
+          PUBLISHED_STABLE: ${{ steps.published_stable.outputs.published_stable }}
+          PUBLISHED_LATEST: ${{ steps.published_latest.outputs.published_latest }}
+        run: |
+          FORCE_ARGS=()
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            FORCE_ARGS=(--force)
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" && "${INPUT_FORCE}" == "true" ]]; then
+            FORCE_ARGS=(--force)
+          fi
+
+          python3 scripts/resolve-upstream.py \
+            --published-stable "${PUBLISHED_STABLE}" \
+            --published-latest "${PUBLISHED_LATEST}" \
+            "${FORCE_ARGS[@]}" \
+            --github-output
+
+  prepare:
+    name: Prepare ${{ matrix.slug }}
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJson(needs.check.outputs.targets) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare build context from upstream
+        env:
+          UPSTREAM_REF: ${{ matrix.digest }}
+          CONTEXT_DIR: ${{ github.workspace }}/context
+        run: |
+          ./scripts/prepare-context.sh
+          version="$(python3 -c 'import json; print(json.load(open("context/package.json"))["version"])')"
+          echo "${version}" > context/VERSION
+          echo "Upstream package version=${version} for ${{ matrix.digest }}"
+
+      - name: Upload build context
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtm-build-context-${{ matrix.slug }}
+          path: context/
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.slug }}-${{ matrix.suffix }}
+    needs: [check, prepare]
+    if: needs.check.outputs.should_build == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJson(needs.check.outputs.build_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Download build context
+        uses: actions/download-artifact@v4
+        with:
+          name: gtm-build-context-${{ matrix.slug }}
+          path: context
+
+      - name: Read package version
+        id: meta
+        run: |
+          if [[ -f context/VERSION ]]; then
+            version="$(cat context/VERSION)"
+          else
+            version="$(python3 -c 'import json; print(json.load(open("context/package.json"))["version"])')"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: context
+          file: context/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-${{ github.run_id }}-${{ matrix.slug }}-${{ matrix.suffix }}
+          labels: |
+            gtm.upstream.digest=${{ matrix.digest }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.title=gtm-cloud-image
+            org.opencontainers.image.description=Unofficial multi-arch rebuild of gcr.io/cloud-tagging-10302018/gtm-cloud-image
+            org.opencontainers.image.base.name=${{ env.UPSTREAM_IMAGE }}
+            org.opencontainers.image.base.digest=${{ matrix.digest }}
+
+  merge:
+    name: Merge ${{ matrix.slug }}
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJson(needs.check.outputs.targets) }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push manifest tags
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAGS_CSV: ${{ matrix.tags_csv }}
+          SLUG: ${{ matrix.slug }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          amd64_ref="${IMAGE}:build-${RUN_ID}-${SLUG}-amd64"
+          arm64_ref="${IMAGE}:build-${RUN_ID}-${SLUG}-arm64"
+
+          tag_args=()
+          IFS=',' read -r -a tags <<< "${TAGS_CSV}"
+          for tag in "${tags[@]}"; do
+            tag_args+=(-t "${IMAGE}:${tag}")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${amd64_ref}" "${arm64_ref}"
+
+          echo "Published tags for ${SLUG}: ${TAGS_CSV}"
+          docker buildx imagetools inspect "${IMAGE}:${tags[0]}"
