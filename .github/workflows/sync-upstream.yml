@@ -22,7 +22,6 @@ permissions:
 env:
   UPSTREAM_IMAGE: gcr.io/cloud-tagging-10302018/gtm-cloud-image
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   check:
@@ -32,9 +31,14 @@ jobs:
       should_build: ${{ steps.upstream.outputs.should_build }}
       targets: ${{ steps.upstream.outputs.targets }}
       build_matrix: ${{ steps.upstream.outputs.build_matrix }}
+      image_name: ${{ steps.image.outputs.image_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Lowercase GHCR image name
+        id: image
+        run: echo "image_name=${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -47,7 +51,7 @@ jobs:
         id: published_stable
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.image_name }}
         run: >
           python3 scripts/read-published-digest.py
           --image "${IMAGE}"
@@ -59,7 +63,7 @@ jobs:
         id: published_latest
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.image_name }}
         run: >
           python3 scripts/read-published-digest.py
           --image "${IMAGE}"
@@ -127,6 +131,8 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.check.outputs.build_matrix) }}
     runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE_NAME: ${{ needs.check.outputs.image_name }}
     steps:
       - name: Download build context
         uses: actions/download-artifact@v4
@@ -182,6 +188,8 @@ jobs:
       fail-fast: true
       matrix:
         include: ${{ fromJson(needs.check.outputs.targets) }}
+    env:
+      IMAGE_NAME: ${{ needs.check.outputs.image_name }}
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@v3
